@@ -3,8 +3,7 @@ use std::{
     env,
     fs::File,
     io::{self, BufRead},
-    net::{IpAddr, SocketAddr},
-    path::Path,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     str::FromStr,
     sync::Arc,
 };
@@ -13,9 +12,10 @@ use domain::{
     base::{
         iana::{Class, Rcode},
         message_builder::AnswerBuilder,
+        name::Label,
         Dname, Message, MessageBuilder, ParsedDname, ToDname,
     },
-    rdata::{Aaaa, A},
+    rdata::A,
 };
 use tokio::{
     net::{TcpListener, UdpSocket},
@@ -23,9 +23,9 @@ use tokio::{
     time,
 };
 
-type DenyIps = Arc<RwLock<Vec<IpAddr>>>;
+type DenyIps = Arc<RwLock<Vec<Ipv4Addr>>>;
 type Whitelist = Arc<RwLock<Vec<Dname<Vec<u8>>>>>;
-type Cache = Arc<RwLock<HashMap<Dname<Vec<u8>>, IpAddr>>>;
+type Cache = Arc<RwLock<HashMap<Dname<Vec<u8>>, Ipv4Addr>>>;
 type UpStreamAddr = Arc<RwLock<SocketAddr>>;
 
 fn gen_answerbuilder(
@@ -60,10 +60,42 @@ async fn check_deny_ip_and_reply(
     }
     Ok(())
 }
+
+async fn check_reversequery_and_reply(
+    addr: &SocketAddr,
+    parsed_dname: &ParsedDname<&Vec<u8>>,
+    reverse_name_last: &Label,
+    msg: &Message<Vec<u8>>,
+    socket: Arc<UdpSocket>,
+) -> Result<(), String> {
+    let mut i = parsed_dname.iter();
+    i.next_back();
+    let l = i.next_back();
+    if let Some(last) = l {
+        if last == reverse_name_last {
+            let reply = gen_answerbuilder(msg, Rcode::NXDomain)?
+                .into_message()
+                .into_octets();
+
+            socket
+                .send_to(&reply, addr)
+                .await
+                .map_err(|_| "response the upstream query result fail!".to_string())?;
+
+            return Err(format!(
+                "{} query {} , is reverse query , not support , deny!",
+                addr, parsed_dname
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn check_whitelist_and_reply(
     addr: &SocketAddr,
     list: Whitelist,
     parsed_dname: &ParsedDname<&Vec<u8>>,
+    fack_ip: Ipv4Addr,
     msg: &Message<Vec<u8>>,
     socket: Arc<UdpSocket>,
 ) -> Result<(), String> {
@@ -72,14 +104,8 @@ async fn check_whitelist_and_reply(
             return Ok(());
         }
     }
-    let reply = gen_answerbuilder(msg, Rcode::Refused)?
-        .into_message()
-        .into_octets();
 
-    socket
-        .send_to(&reply, addr)
-        .await
-        .map_err(|_| "response the upstream query result fail!".to_string())?;
+    reply(addr, msg, fack_ip, 3600, socket).await?;
 
     Err(format!(
         "{} query {} , not in whitelist , deny!",
@@ -90,22 +116,16 @@ async fn check_whitelist_and_reply(
 async fn reply(
     addr: &SocketAddr,
     msg: &Message<Vec<u8>>,
-    ip: IpAddr,
+    ipv4: Ipv4Addr,
+    ttl: u32,
     socket: Arc<UdpSocket>,
 ) -> Result<(), String> {
     let mut answerbuilder = gen_answerbuilder(msg, Rcode::NoError)?;
-    match ip {
-        IpAddr::V4(ipv4) => {
-            answerbuilder
-                .push((Dname::root_ref(), Class::In, 86400, A::new(ipv4)))
-                .map_err(|_| "push answer ip to rely message builder fail!".to_string())?;
-        }
-        IpAddr::V6(ipv6) => {
-            answerbuilder
-                .push((Dname::root_ref(), Class::In, 86400, Aaaa::new(ipv6)))
-                .map_err(|_| "push answer ip to rely message builder fail!".to_string())?;
-        }
-    }
+
+    answerbuilder
+        .push((Dname::root_ref(), Class::In, ttl, A::new(ipv4)))
+        .map_err(|_| "push answer ip to rely message builder fail!".to_string())?;
+
     let reply = answerbuilder.into_message().into_octets();
     socket
         .send_to(&reply, addr)
@@ -177,11 +197,13 @@ async fn main() {
     let tcp_denyips = denyips.clone();
     let tcp_whitelist = whitelist.clone();
     let tcp_cache = cache.clone();
-
+    let reverse_name_last_lable =
+        Label::from_slice(b"arpa").expect("parse reverse name last lable err!");
+    let fack_ip = Ipv4Addr::from_str("1.2.3.4").expect("parse fack ip err!");
     tokio::spawn(async move {
         loop {
             let (stream, addr) = tcp.accept().await.expect("tcp accept a stream fail!");
-            //dynamic change dns config 
+            //dynamic change dns config
         }
     });
 
@@ -196,6 +218,7 @@ async fn main() {
         let whitelist = udp_whitelist.clone();
         let cache = udp_cache.clone();
         let upstream_addr = upstream_addr.clone();
+
         if let Ok((len, addr)) = udp.recv_from(&mut buf).await {
             let buf = buf[..len].to_vec();
             tokio::spawn(async move {
@@ -211,15 +234,31 @@ async fn main() {
 
                     let parsed_dname = question.qname();
 
-                    check_whitelist_and_reply(&addr, whitelist, parsed_dname, &msg, udp.clone())
-                        .await?;
+                    check_reversequery_and_reply(
+                        &addr,
+                        parsed_dname,
+                        &reverse_name_last_lable,
+                        &msg,
+                        udp.clone(),
+                    )
+                    .await?;
+
+                    check_whitelist_and_reply(
+                        &addr,
+                        whitelist,
+                        parsed_dname,
+                        fack_ip,
+                        &msg,
+                        udp.clone(),
+                    )
+                    .await?;
 
                     let dname: Dname<Vec<u8>> = parsed_dname
                         .to_dname()
                         .map_err(|_| "parse question section qname to dname fail".to_string())?;
 
                     match cache.read().await.get(&dname) {
-                        Some(ip) => reply(&addr, &msg, ip.to_owned(), udp.clone()).await?,
+                        Some(ip) => reply(&addr, &msg, ip.to_owned(), 86400, udp.clone()).await?,
                         None => {
                             reply_from_upstream(upstream_addr.clone(), &addr, &msg, udp.clone())
                                 .await?
@@ -260,14 +299,14 @@ fn init() -> (DenyIps, Whitelist, Cache, UpStreamAddr) {
         Ok(io::BufReader::new(file).lines())
     };
 
-    let parse_line_to_hashmap = |line: &str| -> Result<(Dname<Vec<u8>>, IpAddr), &'static str> {
+    let parse_line_to_hashmap = |line: &str| -> Result<(Dname<Vec<u8>>, Ipv4Addr), &'static str> {
         let mut s = line.trim().split(' ');
 
         let n = s.next().ok_or("missing danme field in this line")?;
         let key = Dname::<Vec<u8>>::from_str(n).map_err(|_| "parse dname  err")?;
 
         let i = s.next().ok_or("missing ip field in line")?;
-        let ip = IpAddr::from_str(i).map_err(|_| "parse ip field err")?;
+        let ip = Ipv4Addr::from_str(i).map_err(|_| "parse ip field err")?;
 
         Ok((key, ip))
     };
@@ -278,7 +317,7 @@ fn init() -> (DenyIps, Whitelist, Cache, UpStreamAddr) {
             if let Ok(line) = line {
                 let line = line.trim();
                 if !line.is_empty() {
-                    match IpAddr::from_str(&line) {
+                    match Ipv4Addr::from_str(&line) {
                         Ok(a) => deny_ips.push(a),
                         Err(_) => {
                             panic!("parse deny_ip_list line {} to ipaddr err!", index);
